@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -8,6 +9,7 @@ import (
 	"math/big"
 
 	"github.com/fbsobreira/gotron-sdk/pkg/client"
+	"github.com/fbsobreira/gotron-sdk/pkg/contract"
 
 	"github.com/fbsobreira/gotron-examples/utils"
 )
@@ -41,7 +43,6 @@ func main() {
 	flag.BoolVar(&dryRun, "dryrun", false, "Sign transaction but do not broadcast")
 	flag.Parse()
 
-	// Validate required flags per action
 	switch action {
 	case "simulate-rent", "simulate-return", "rent", "return":
 		if receiver == "" {
@@ -65,20 +66,21 @@ func main() {
 	}
 
 	conn := utils.NewGRPCClient(node)
+	ctx := context.Background()
 
 	switch action {
 	case "simulate-rent":
-		simulateRent(conn, renter, receiver, trxToSun(amountTRX), resourceType)
+		simulateRent(ctx, conn, renter, receiver, trxToSun(amountTRX), resourceType)
 	case "simulate-return":
-		simulateReturn(conn, renter, receiver, trxToSun(amountTRX), resourceType)
+		simulateReturn(ctx, conn, renter, receiver, trxToSun(amountTRX), resourceType)
 	case "rent":
-		executeRent(conn, receiver, trxToSun(amountTRX), resourceType, dryRun)
+		executeRent(ctx, conn, receiver, trxToSun(amountTRX), resourceType, dryRun)
 	case "return":
-		executeReturn(conn, receiver, trxToSun(amountTRX), resourceType, dryRun)
+		executeReturn(ctx, conn, receiver, trxToSun(amountTRX), resourceType, dryRun)
 	case "info":
-		queryRentalInfo(conn, renter, receiver, resourceType)
+		queryRentalInfo(ctx, conn, renter, receiver, resourceType)
 	case "rates":
-		queryRates(conn, trxToSun(amountTRX), resourceType)
+		queryRates(ctx, conn, trxToSun(amountTRX), resourceType)
 	default:
 		log.Fatalf("unknown action: %s", action)
 	}
@@ -92,8 +94,13 @@ func trxToSun(trx float64) int64 {
 	return int64(sun)
 }
 
-// simulateRent calls rentResource via TriggerConstantContract (read-only simulation)
-func simulateRent(conn *client.GrpcClient, from, receiver string, amountSun int64, resourceType int) {
+// rentParams builds the JSON parameter string for rent/return operations.
+func rentParams(receiver string, amountSun int64, resourceType int) string {
+	return fmt.Sprintf(`["%s", "%d", "%d"]`, receiver, amountSun, resourceType)
+}
+
+// simulateRent calls rentResource via a read-only constant call (no fees).
+func simulateRent(ctx context.Context, conn *client.GrpcClient, from, receiver string, amountSun int64, resourceType int) {
 	fmt.Println("=== Simulate Rent Resource ===")
 	fmt.Printf("From:     %s\n", from)
 	fmt.Printf("Receiver: %s\n", receiver)
@@ -101,27 +108,26 @@ func simulateRent(conn *client.GrpcClient, from, receiver string, amountSun int6
 	fmt.Printf("Resource: %s\n", resourceName(resourceType))
 	fmt.Println()
 
-	params := fmt.Sprintf(`[{"address":"%s"},{"uint256":"%d"},{"uint256":"%d"}]`,
-		receiver, amountSun, resourceType)
-
-	// Note: TriggerConstantContract sends msg.value=0, so JustLend's security deposit
-	// check will always revert here. This only validates ABI encoding and gas estimation.
-	tx, err := conn.TriggerConstantContract(
-		from,
-		EnergyRentalContract,
-		"rentResource(address,uint256,uint256)",
-		params,
-	)
+	// Note: constant call sends msg.value=0, so JustLend's security deposit
+	// check will always revert. This only validates ABI encoding and gas estimation.
+	result, err := contract.New(conn, EnergyRentalContract).
+		From(from).
+		Method("rentResource(address,uint256,uint256)").
+		Params(rentParams(receiver, amountSun, resourceType)).
+		Call(ctx)
 	if err != nil {
 		log.Fatalf("simulate rent failed: %v", err)
 	}
 
-	utils.PrintTxResult(tx)
-	fmt.Println("Note: revert is expected — TriggerConstantContract sends 0 TRX; use -action rent -dryrun to validate signing.")
+	fmt.Printf("Energy Used: %d\n", result.EnergyUsed)
+	if len(result.RawResults) > 0 {
+		fmt.Printf("Output: %x\n", result.RawResults[0])
+	}
+	fmt.Println("Note: revert is expected — constant call sends 0 TRX; use -action rent -dryrun to validate signing.")
 }
 
-// simulateReturn calls returnResource via TriggerConstantContract (read-only simulation)
-func simulateReturn(conn *client.GrpcClient, from, receiver string, amountSun int64, resourceType int) {
+// simulateReturn calls returnResource via a read-only constant call (no fees).
+func simulateReturn(ctx context.Context, conn *client.GrpcClient, from, receiver string, amountSun int64, resourceType int) {
 	fmt.Println("=== Simulate Return Resource ===")
 	fmt.Printf("From:     %s\n", from)
 	fmt.Printf("Receiver: %s\n", receiver)
@@ -129,176 +135,196 @@ func simulateReturn(conn *client.GrpcClient, from, receiver string, amountSun in
 	fmt.Printf("Resource: %s\n", resourceName(resourceType))
 	fmt.Println()
 
-	params := fmt.Sprintf(`[{"address":"%s"},{"uint256":"%d"},{"uint256":"%d"}]`,
-		receiver, amountSun, resourceType)
-
-	tx, err := conn.TriggerConstantContract(
-		from,
-		EnergyRentalContract,
-		"returnResource(address,uint256,uint256)",
-		params,
-	)
+	result, err := contract.New(conn, EnergyRentalContract).
+		From(from).
+		Method("returnResource(address,uint256,uint256)").
+		Params(rentParams(receiver, amountSun, resourceType)).
+		Call(ctx)
 	if err != nil {
 		log.Fatalf("simulate return failed: %v", err)
 	}
 
-	utils.PrintTxResult(tx)
+	fmt.Printf("Energy Used: %d\n", result.EnergyUsed)
+	if len(result.RawResults) > 0 {
+		fmt.Printf("Output: %x\n", result.RawResults[0])
+	}
 }
 
-// executeRent calls rentResource via TriggerContract, signs, and optionally broadcasts.
-func executeRent(conn *client.GrpcClient, receiver string, amountSun int64, resourceType int, dryRun bool) {
+// executeRent builds, signs, and optionally broadcasts a rentResource transaction.
+func executeRent(ctx context.Context, conn *client.GrpcClient, receiver string, amountSun int64, resourceType int, dryRun bool) {
 	signer := utils.LoadSigner()
+	from := signer.Address().String()
 
 	fmt.Println("=== Execute Rent Resource ===")
-	fmt.Printf("From:     %s\n", signer.Address)
+	fmt.Printf("From:     %s\n", from)
 	fmt.Printf("Receiver: %s\n", receiver)
 	fmt.Printf("Amount:   %s (%d sun)\n", utils.FormatTRX(amountSun), amountSun)
 	fmt.Printf("Resource: %s\n", resourceName(resourceType))
 	fmt.Println()
 
-	params := fmt.Sprintf(`[{"address":"%s"},{"uint256":"%d"},{"uint256":"%d"}]`,
-		receiver, amountSun, resourceType)
+	call := contract.New(conn, EnergyRentalContract).
+		From(from).
+		Method("rentResource(address,uint256,uint256)").
+		Params(rentParams(receiver, amountSun, resourceType)).
+		WithFeeLimit(100_000_000).
+		WithCallValue(amountSun) // security deposit in sun
 
-	tx, err := conn.TriggerContract(
-		signer.Address,
-		EnergyRentalContract,
-		"rentResource(address,uint256,uint256)",
-		params,
-		100_000_000, // feeLimit: 100 TRX
-		amountSun,   // callValue: security deposit in sun
-		"",
-		0,
-	)
+	if dryRun {
+		txExt, err := call.Build(ctx)
+		if err != nil {
+			log.Fatalf("build rent tx failed: %v", err)
+		}
+		signed, err := signer.Sign(txExt.GetTransaction())
+		if err != nil {
+			log.Fatalf("signing failed: %v", err)
+		}
+		fmt.Printf("TxID:   %x\n", txExt.GetTxid())
+		fmt.Printf("Signed: yes (%d signature(s))\n", len(signed.GetSignature()))
+		fmt.Println("Mode:   DRY RUN (not broadcast)")
+		return
+	}
+
+	receipt, err := call.Send(ctx, signer)
 	if err != nil {
 		log.Fatalf("execute rent failed: %v", err)
 	}
 
-	signer.SignAndBroadcast(conn, tx, dryRun)
+	fmt.Printf("TxID:   %s\n", receipt.TxID)
+	fmt.Printf("Broadcast: SUCCESS (check explorer for execution result)\n")
 }
 
-// executeReturn calls returnResource via TriggerContract, signs, and optionally broadcasts.
-func executeReturn(conn *client.GrpcClient, receiver string, amountSun int64, resourceType int, dryRun bool) {
+// executeReturn builds, signs, and optionally broadcasts a returnResource transaction.
+func executeReturn(ctx context.Context, conn *client.GrpcClient, receiver string, amountSun int64, resourceType int, dryRun bool) {
 	signer := utils.LoadSigner()
+	from := signer.Address().String()
 
 	fmt.Println("=== Execute Return Resource ===")
-	fmt.Printf("From:     %s\n", signer.Address)
+	fmt.Printf("From:     %s\n", from)
 	fmt.Printf("Receiver: %s\n", receiver)
 	fmt.Printf("Amount:   %s (%d sun)\n", utils.FormatTRX(amountSun), amountSun)
 	fmt.Printf("Resource: %s\n", resourceName(resourceType))
 	fmt.Println()
 
-	params := fmt.Sprintf(`[{"address":"%s"},{"uint256":"%d"},{"uint256":"%d"}]`,
-		receiver, amountSun, resourceType)
+	call := contract.New(conn, EnergyRentalContract).
+		From(from).
+		Method("returnResource(address,uint256,uint256)").
+		Params(rentParams(receiver, amountSun, resourceType)).
+		WithFeeLimit(100_000_000)
 
-	tx, err := conn.TriggerContract(
-		signer.Address,
-		EnergyRentalContract,
-		"returnResource(address,uint256,uint256)",
-		params,
-		100_000_000, // feeLimit: 100 TRX
-		0,
-		"",
-		0,
-	)
+	if dryRun {
+		txExt, err := call.Build(ctx)
+		if err != nil {
+			log.Fatalf("build return tx failed: %v", err)
+		}
+		signed, err := signer.Sign(txExt.GetTransaction())
+		if err != nil {
+			log.Fatalf("signing failed: %v", err)
+		}
+		fmt.Printf("TxID:   %x\n", txExt.GetTxid())
+		fmt.Printf("Signed: yes (%d signature(s))\n", len(signed.GetSignature()))
+		fmt.Println("Mode:   DRY RUN (not broadcast)")
+		return
+	}
+
+	receipt, err := call.Send(ctx, signer)
 	if err != nil {
 		log.Fatalf("execute return failed: %v", err)
 	}
 
-	signer.SignAndBroadcast(conn, tx, dryRun)
+	fmt.Printf("TxID:   %s\n", receipt.TxID)
+	fmt.Printf("Broadcast: SUCCESS (check explorer for execution result)\n")
 }
 
 // queryRentalInfo fetches rental details for a renter/receiver pair.
-func queryRentalInfo(conn *client.GrpcClient, renter, receiver string, resourceType int) {
+func queryRentalInfo(ctx context.Context, conn *client.GrpcClient, renter, receiver string, resourceType int) {
 	fmt.Println("=== Rental Info ===")
 	fmt.Printf("Renter:   %s\n", renter)
 	fmt.Printf("Receiver: %s\n", receiver)
 	fmt.Printf("Resource: %s\n", resourceName(resourceType))
 	fmt.Println()
 
-	params := fmt.Sprintf(`[{"address":"%s"},{"address":"%s"},{"uint256":"%d"}]`,
-		renter, receiver, resourceType)
+	params := fmt.Sprintf(`["%s", "%s", "%d"]`, renter, receiver, resourceType)
 
-	tx, err := conn.TriggerConstantContract(
-		"",
-		EnergyRentalContract,
-		"rentals(address,address,uint256)",
-		params,
-	)
+	result, err := contract.New(conn, EnergyRentalContract).
+		Method("rentals(address,address,uint256)").
+		Params(params).
+		Call(ctx)
 	if err != nil {
 		log.Fatalf("query rentals failed: %v", err)
 	}
 
-	if len(tx.GetConstantResult()) > 0 {
-		result := tx.GetConstantResult()[0]
-		if len(result) >= 96 {
-			// ABI tuple: (uint256 amount, uint256 deposit, uint256 rentIndex)
-			amount := new(big.Int).SetBytes(result[0:32])
-			deposit := new(big.Int).SetBytes(result[32:64])
-			rentIdx := new(big.Int).SetBytes(result[64:96])
+	if len(result.RawResults) > 0 && len(result.RawResults[0]) >= 96 {
+		data := result.RawResults[0]
+		// ABI tuple: (uint256 amount, uint256 deposit, uint256 rentIndex)
+		amount := new(big.Int).SetBytes(data[0:32])
+		deposit := new(big.Int).SetBytes(data[32:64])
+		rentIdx := new(big.Int).SetBytes(data[64:96])
+		if amount.IsInt64() {
 			fmt.Printf("Amount:           %s\n", utils.FormatTRX(amount.Int64()))
-			fmt.Printf("Security Deposit: %s\n", utils.FormatTRX(deposit.Int64()))
-			fmt.Printf("Rent Index:       %s\n", rentIdx.String())
 		} else {
-			fmt.Println("No active rental found")
+			fmt.Printf("Amount:           %s sun\n", amount.String())
 		}
+		if deposit.IsInt64() {
+			fmt.Printf("Security Deposit: %s\n", utils.FormatTRX(deposit.Int64()))
+		} else {
+			fmt.Printf("Security Deposit: %s sun\n", deposit.String())
+		}
+		fmt.Printf("Rent Index:       %s\n", rentIdx.String())
+	} else {
+		fmt.Println("No active rental found")
 	}
 }
 
 // queryRates fetches the current rental rate for a given amount and resource type.
-func queryRates(conn *client.GrpcClient, amountSun int64, resourceType int) {
+func queryRates(ctx context.Context, conn *client.GrpcClient, amountSun int64, resourceType int) {
 	fmt.Println("=== Rental Rates ===")
 	fmt.Printf("Amount:   %s\n", utils.FormatTRX(amountSun))
 	fmt.Printf("Resource: %s\n", resourceName(resourceType))
 	fmt.Println()
 
 	// Query _rentalRate
-	params := fmt.Sprintf(`[{"uint256":"%d"},{"uint256":"%d"}]`, amountSun, resourceType)
-	tx, err := conn.TriggerConstantContract(
-		"",
-		EnergyRentalContract,
-		"_rentalRate(uint256,uint256)",
-		params,
-	)
+	rateResult, err := contract.New(conn, EnergyRentalContract).
+		Method("_rentalRate(uint256,uint256)").
+		Params(fmt.Sprintf(`["%d", "%d"]`, amountSun, resourceType)).
+		Call(ctx)
 	if err != nil {
 		log.Fatalf("query rental rate failed: %v", err)
 	}
 
-	if len(tx.GetConstantResult()) > 0 {
-		rate := new(big.Int).SetBytes(tx.GetConstantResult()[0])
+	if len(rateResult.RawResults) > 0 {
+		rate := new(big.Int).SetBytes(rateResult.RawResults[0])
 		fmt.Printf("Rental Rate:    %s (per second, scaled 1e18)\n", rate.String())
 	}
 
 	// Query _liquidateRate
-	liqParams := fmt.Sprintf(`[{"uint256":"%d"}]`, resourceType)
-	tx2, err := conn.TriggerConstantContract(
-		"",
-		EnergyRentalContract,
-		"_liquidateRate(uint256)",
-		liqParams,
-	)
+	liqResult, err := contract.New(conn, EnergyRentalContract).
+		Method("_liquidateRate(uint256)").
+		Params(fmt.Sprintf(`["%d"]`, resourceType)).
+		Call(ctx)
 	if err != nil {
 		log.Fatalf("query liquidate rate failed: %v", err)
 	}
 
-	if len(tx2.GetConstantResult()) > 0 {
-		rate := new(big.Int).SetBytes(tx2.GetConstantResult()[0])
+	if len(liqResult.RawResults) > 0 {
+		rate := new(big.Int).SetBytes(liqResult.RawResults[0])
 		fmt.Printf("Liquidate Rate: %s (per second, scaled 1e18)\n", rate.String())
 	}
 
 	// Query totalRent
-	tx3, err := conn.TriggerConstantContract(
-		"",
-		EnergyRentalContract,
-		"totalRent()",
-		"",
-	)
+	totalResult, err := contract.New(conn, EnergyRentalContract).
+		Method("totalRent()").
+		Call(ctx)
 	if err != nil {
 		log.Fatalf("query total rent failed: %v", err)
 	}
 
-	if len(tx3.GetConstantResult()) > 0 {
-		total := new(big.Int).SetBytes(tx3.GetConstantResult()[0])
-		fmt.Printf("Total Rent:     %s\n", utils.FormatTRX(total.Int64()))
+	if len(totalResult.RawResults) > 0 {
+		total := new(big.Int).SetBytes(totalResult.RawResults[0])
+		if total.IsInt64() {
+			fmt.Printf("Total Rent:     %s\n", utils.FormatTRX(total.Int64()))
+		} else {
+			fmt.Printf("Total Rent:     %s sun\n", total.String())
+		}
 	}
 }
 

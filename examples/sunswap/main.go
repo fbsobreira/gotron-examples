@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -10,7 +11,7 @@ import (
 
 	"github.com/fbsobreira/gotron-sdk/pkg/address"
 	"github.com/fbsobreira/gotron-sdk/pkg/client"
-	"github.com/fbsobreira/gotron-sdk/pkg/proto/api"
+	"github.com/fbsobreira/gotron-sdk/pkg/contract"
 
 	"github.com/fbsobreira/gotron-examples/utils"
 )
@@ -42,7 +43,7 @@ func main() {
 	flag.StringVar(&tokenIn, "token-in", WTRX, "Input token address")
 	flag.StringVar(&tokenOut, "token-out", USDT, "Output token address")
 	flag.StringVar(&amountIn, "amount", "1000000", "Input amount in token smallest unit (sun for TRX)")
-	flag.Float64Var(&slippage, "slippage", 0.5, "Slippage tolerance in percent (0–100)")
+	flag.Float64Var(&slippage, "slippage", 0.5, "Slippage tolerance in percent (0-100)")
 	flag.StringVar(&node, "node", "", "gRPC node (default: grpc.trongrid.io:50051)")
 	flag.BoolVar(&dryRun, "dryrun", false, "Sign transaction but do not broadcast")
 	flag.Parse()
@@ -52,6 +53,7 @@ func main() {
 	}
 
 	conn := utils.NewGRPCClient(node)
+	ctx := context.Background()
 
 	amount, ok := new(big.Int).SetString(amountIn, 10)
 	if !ok {
@@ -60,54 +62,44 @@ func main() {
 
 	switch action {
 	case "quote":
-		getQuote(conn, tokenIn, tokenOut, amount)
+		getQuote(ctx, conn, tokenIn, tokenOut, amount)
 	case "simulate-swap":
 		if from == "" {
 			log.Fatal("required: -from for simulate-swap")
 		}
-		simulateSwap(conn, from, tokenIn, tokenOut, amount, slippage)
+		simulateSwap(ctx, conn, from, tokenIn, tokenOut, amount, slippage)
 	case "swap":
-		executeSwap(conn, tokenIn, tokenOut, amount, slippage, dryRun)
+		executeSwap(ctx, conn, tokenIn, tokenOut, amount, slippage, dryRun)
 	case "pair":
-		getPair(conn, tokenIn, tokenOut)
+		getPair(ctx, conn, tokenIn, tokenOut)
 	default:
 		log.Fatalf("unknown action: %s", action)
 	}
 }
 
 // getQuote calls getAmountsOut on the router to get a price quote.
-func getQuote(conn *client.GrpcClient, tokenIn, tokenOut string, amountIn *big.Int) {
+func getQuote(ctx context.Context, conn *client.GrpcClient, tokenIn, tokenOut string, amountIn *big.Int) {
 	fmt.Println("=== SunSwap V2 Quote ===")
 	fmt.Printf("Token In:  %s\n", tokenIn)
 	fmt.Printf("Token Out: %s\n", tokenOut)
 	fmt.Printf("Amount In: %s\n", amountIn.String())
 	fmt.Println()
 
-	params := fmt.Sprintf(`[{"uint256":"%s"},{"address[]":["%s","%s"]}]`,
-		amountIn.String(), tokenIn, tokenOut)
-
-	tx, err := conn.TriggerConstantContract(
-		"",
-		SunSwapV2Router,
-		"getAmountsOut(uint256,address[])",
-		params,
-	)
+	result, err := contract.New(conn, SunSwapV2Router).
+		Method("getAmountsOut(uint256,address[])").
+		Params(fmt.Sprintf(`["%s", ["%s", "%s"]]`, amountIn.String(), tokenIn, tokenOut)).
+		Call(ctx)
 	if err != nil {
 		log.Fatalf("getAmountsOut failed: %v", err)
 	}
 
-	if tx.GetResult().GetCode() != 0 {
-		fmt.Printf("Error: %s\n", string(tx.GetResult().GetMessage()))
-		return
-	}
-
-	decodeAmountsOutput(tx)
+	decodeAmountsOutput(result.RawResults)
 }
 
-// simulateSwap simulates the swap via TriggerConstantContract.
-// For WTRX input (TRX→Token), uses swapExactETHForTokens; otherwise swapExactTokensForTokens.
-// Note: the WTRX path will revert because TriggerConstantContract cannot send TRX (msg.value=0).
-func simulateSwap(conn *client.GrpcClient, from, tokenIn, tokenOut string, amountIn *big.Int, slippage float64) {
+// simulateSwap simulates the swap via a read-only constant call.
+// For WTRX input (TRX->Token), uses swapExactETHForTokens; otherwise swapExactTokensForTokens.
+// Note: the WTRX path will revert because constant calls cannot send TRX (msg.value=0).
+func simulateSwap(ctx context.Context, conn *client.GrpcClient, from, tokenIn, tokenOut string, amountIn *big.Int, slippage float64) {
 	fmt.Println("=== Simulate Swap ===")
 	fmt.Printf("From:      %s\n", from)
 	fmt.Printf("Token In:  %s\n", tokenIn)
@@ -116,20 +108,16 @@ func simulateSwap(conn *client.GrpcClient, from, tokenIn, tokenOut string, amoun
 	fmt.Printf("Slippage:  %.1f%%\n", slippage)
 	fmt.Println()
 
-	quoteParams := fmt.Sprintf(`[{"uint256":"%s"},{"address[]":["%s","%s"]}]`,
-		amountIn.String(), tokenIn, tokenOut)
-
-	quoteTx, err := conn.TriggerConstantContract(
-		"",
-		SunSwapV2Router,
-		"getAmountsOut(uint256,address[])",
-		quoteParams,
-	)
+	// Get quote first
+	quoteResult, err := contract.New(conn, SunSwapV2Router).
+		Method("getAmountsOut(uint256,address[])").
+		Params(fmt.Sprintf(`["%s", ["%s", "%s"]]`, amountIn.String(), tokenIn, tokenOut)).
+		Call(ctx)
 	if err != nil {
 		log.Fatalf("quote failed: %v", err)
 	}
 
-	expectedOut := decodeLastAmount(quoteTx)
+	expectedOut := decodeLastAmount(quoteResult.RawResults)
 	if expectedOut == nil {
 		log.Fatal("could not decode quote output")
 	}
@@ -140,55 +128,58 @@ func simulateSwap(conn *client.GrpcClient, from, tokenIn, tokenOut string, amoun
 
 	deadline := time.Now().Add(20 * time.Minute).Unix()
 
-	var method string
-	var params string
+	var call *contract.ContractCall
 	if tokenIn == WTRX {
-		// TRX→Token: swapExactETHForTokens (amountIn sent as msg.value, not a param)
-		method = "swapExactETHForTokens(uint256,address[],address,uint256)"
-		params = fmt.Sprintf(`[{"uint256":"%s"},{"address[]":["%s","%s"]},{"address":"%s"},{"uint256":"%d"}]`,
-			minOut.String(), tokenIn, tokenOut, from, deadline)
+		// TRX->Token: swapExactETHForTokens (amountIn sent as msg.value, not a param)
+		call = contract.New(conn, SunSwapV2Router).
+			From(from).
+			Method("swapExactETHForTokens(uint256,address[],address,uint256)").
+			Params(fmt.Sprintf(`["%s", ["%s", "%s"], "%s", "%d"]`,
+				minOut.String(), tokenIn, tokenOut, from, deadline))
 		fmt.Println("Note: WTRX path uses swapExactETHForTokens; simulation will revert (msg.value=0 in constant call).")
 	} else {
-		// Token→Token: swapExactTokensForTokens
-		method = "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)"
-		params = fmt.Sprintf(`[{"uint256":"%s"},{"uint256":"%s"},{"address[]":["%s","%s"]},{"address":"%s"},{"uint256":"%d"}]`,
-			amountIn.String(), minOut.String(), tokenIn, tokenOut, from, deadline)
+		// Token->Token: swapExactTokensForTokens
+		call = contract.New(conn, SunSwapV2Router).
+			From(from).
+			Method("swapExactTokensForTokens(uint256,uint256,address[],address,uint256)").
+			Params(fmt.Sprintf(`["%s", "%s", ["%s", "%s"], "%s", "%d"]`,
+				amountIn.String(), minOut.String(), tokenIn, tokenOut, from, deadline))
 	}
 
-	tx, err := conn.TriggerConstantContract(from, SunSwapV2Router, method, params)
+	result, err := call.Call(ctx)
 	if err != nil {
 		log.Fatalf("simulate swap failed: %v", err)
 	}
 
-	utils.PrintTxResult(tx)
+	fmt.Printf("Energy Used: %d\n", result.EnergyUsed)
+	if len(result.RawResults) > 0 {
+		fmt.Printf("Output: %x\n", result.RawResults[0])
+	}
 }
 
 // executeSwap builds a swap transaction, signs it, and optionally broadcasts.
-func executeSwap(conn *client.GrpcClient, tokenIn, tokenOut string, amountIn *big.Int, slippage float64, dryRun bool) {
+func executeSwap(ctx context.Context, conn *client.GrpcClient, tokenIn, tokenOut string, amountIn *big.Int, slippage float64, dryRun bool) {
 	signer := utils.LoadSigner()
+	from := signer.Address().String()
 
 	fmt.Println("=== Execute Swap ===")
-	fmt.Printf("From:      %s\n", signer.Address)
+	fmt.Printf("From:      %s\n", from)
 	fmt.Printf("Token In:  %s\n", tokenIn)
 	fmt.Printf("Token Out: %s\n", tokenOut)
 	fmt.Printf("Amount In: %s\n", amountIn.String())
 	fmt.Printf("Slippage:  %.1f%%\n", slippage)
 	fmt.Println()
 
-	quoteParams := fmt.Sprintf(`[{"uint256":"%s"},{"address[]":["%s","%s"]}]`,
-		amountIn.String(), tokenIn, tokenOut)
-
-	quoteTx, err := conn.TriggerConstantContract(
-		"",
-		SunSwapV2Router,
-		"getAmountsOut(uint256,address[])",
-		quoteParams,
-	)
+	// Get quote first
+	quoteResult, err := contract.New(conn, SunSwapV2Router).
+		Method("getAmountsOut(uint256,address[])").
+		Params(fmt.Sprintf(`["%s", ["%s", "%s"]]`, amountIn.String(), tokenIn, tokenOut)).
+		Call(ctx)
 	if err != nil {
 		log.Fatalf("quote failed: %v", err)
 	}
 
-	expectedOut := decodeLastAmount(quoteTx)
+	expectedOut := decodeLastAmount(quoteResult.RawResults)
 	if expectedOut == nil {
 		log.Fatal("could not decode quote output")
 	}
@@ -199,76 +190,87 @@ func executeSwap(conn *client.GrpcClient, tokenIn, tokenOut string, amountIn *bi
 
 	deadline := time.Now().Add(20 * time.Minute).Unix()
 
-	var callValue int64
-	var method, params string
+	var call *contract.ContractCall
 	if tokenIn == WTRX {
-		// TRX→Token: amountIn is sent as native TRX (callValue), not an ABI param
+		// TRX->Token: amountIn is sent as native TRX (callValue), not an ABI param
 		if !amountIn.IsInt64() {
 			log.Fatal("amount is too large to use as TRX callValue (exceeds int64)")
 		}
-		callValue = amountIn.Int64()
-		method = "swapExactETHForTokens(uint256,address[],address,uint256)"
-		params = fmt.Sprintf(`[{"uint256":"%s"},{"address[]":["%s","%s"]},{"address":"%s"},{"uint256":"%d"}]`,
-			minOut.String(), tokenIn, tokenOut, signer.Address, deadline)
+		call = contract.New(conn, SunSwapV2Router).
+			From(from).
+			Method("swapExactETHForTokens(uint256,address[],address,uint256)").
+			Params(fmt.Sprintf(`["%s", ["%s", "%s"], "%s", "%d"]`,
+				minOut.String(), tokenIn, tokenOut, from, deadline)).
+			WithFeeLimit(150_000_000).
+			WithCallValue(amountIn.Int64())
 	} else {
-		// Token→Token: no callValue needed
-		method = "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)"
-		params = fmt.Sprintf(`[{"uint256":"%s"},{"uint256":"%s"},{"address[]":["%s","%s"]},{"address":"%s"},{"uint256":"%d"}]`,
-			amountIn.String(), minOut.String(), tokenIn, tokenOut, signer.Address, deadline)
+		// Token->Token: no callValue needed
+		call = contract.New(conn, SunSwapV2Router).
+			From(from).
+			Method("swapExactTokensForTokens(uint256,uint256,address[],address,uint256)").
+			Params(fmt.Sprintf(`["%s", "%s", ["%s", "%s"], "%s", "%d"]`,
+				amountIn.String(), minOut.String(), tokenIn, tokenOut, from, deadline)).
+			WithFeeLimit(150_000_000)
 	}
 
-	tx, err := conn.TriggerContract(
-		signer.Address,
-		SunSwapV2Router,
-		method,
-		params,
-		150_000_000, // feeLimit: 150 TRX
-		callValue,
-		"",
-		0,
-	)
+	if dryRun {
+		txExt, err := call.Build(ctx)
+		if err != nil {
+			log.Fatalf("build swap tx failed: %v", err)
+		}
+		signed, err := signer.Sign(txExt.GetTransaction())
+		if err != nil {
+			log.Fatalf("signing failed: %v", err)
+		}
+		fmt.Printf("TxID:   %x\n", txExt.GetTxid())
+		fmt.Printf("Signed: yes (%d signature(s))\n", len(signed.GetSignature()))
+		fmt.Println("Mode:   DRY RUN (not broadcast)")
+		return
+	}
+
+	receipt, err := call.Send(ctx, signer)
 	if err != nil {
 		log.Fatalf("execute swap failed: %v", err)
 	}
 
-	signer.SignAndBroadcast(conn, tx, dryRun)
+	fmt.Printf("TxID:   %s\n", receipt.TxID)
+	fmt.Printf("Broadcast: SUCCESS (check explorer for execution result)\n")
 }
 
 // getPair looks up the pair contract address for two tokens.
-func getPair(conn *client.GrpcClient, tokenA, tokenB string) {
+func getPair(ctx context.Context, conn *client.GrpcClient, tokenA, tokenB string) {
 	fmt.Println("=== Get Pair ===")
 	fmt.Printf("Token A: %s\n", tokenA)
 	fmt.Printf("Token B: %s\n", tokenB)
 	fmt.Println()
 
-	params := fmt.Sprintf(`[{"address":"%s"},{"address":"%s"}]`, tokenA, tokenB)
-
-	tx, err := conn.TriggerConstantContract(
-		"",
-		SunSwapV2Router,
-		"getPairOffChain(address,address)",
-		params,
-	)
+	result, err := contract.New(conn, SunSwapV2Router).
+		Method("getPairOffChain(address,address)").
+		Params(fmt.Sprintf(`["%s", "%s"]`, tokenA, tokenB)).
+		Call(ctx)
 	if err != nil {
 		log.Fatalf("getPairOffChain failed: %v", err)
 	}
 
-	if len(tx.GetConstantResult()) > 0 && len(tx.GetConstantResult()[0]) >= 32 {
-		data := tx.GetConstantResult()[0]
+	if len(result.RawResults) > 0 && len(result.RawResults[0]) >= 32 {
+		data := result.RawResults[0]
 		// ABI address: 32-byte word, last 20 bytes. TRON adds 0x41 prefix.
 		hexAddr := "41" + hex.EncodeToString(data[12:32])
-		addr := address.HexToAddress(hexAddr)
+		addr, err := address.HexToAddress(hexAddr)
+		if err != nil {
+			log.Fatalf("invalid pair address: %v", err)
+		}
 		fmt.Printf("Pair: %s\n", addr.String())
 	}
 }
 
-func decodeAmountsOutput(tx *api.TransactionExtention) {
-	if len(tx.GetConstantResult()) == 0 {
+func decodeAmountsOutput(rawResults [][]byte) {
+	if len(rawResults) == 0 {
 		fmt.Println("No output")
 		return
 	}
 
-	data := tx.GetConstantResult()[0]
+	data := rawResults[0]
 	fmt.Printf("Raw output: %s\n", hex.EncodeToString(data))
 
 	// ABI-encoded dynamic array: offset(32) + length(32) + elements(32 each)
@@ -286,12 +288,12 @@ func decodeAmountsOutput(tx *api.TransactionExtention) {
 	}
 }
 
-func decodeLastAmount(tx *api.TransactionExtention) *big.Int {
-	if len(tx.GetConstantResult()) == 0 {
+func decodeLastAmount(rawResults [][]byte) *big.Int {
+	if len(rawResults) == 0 {
 		return nil
 	}
 
-	data := tx.GetConstantResult()[0]
+	data := rawResults[0]
 	if len(data) < 64 {
 		return nil
 	}

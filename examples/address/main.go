@@ -8,5 +8,5 @@ import (
 
 func main() {
 	signer := utils.LoadSigner()
-	fmt.Println(signer.Address)
+	fmt.Println(signer.Address().String())
 }
