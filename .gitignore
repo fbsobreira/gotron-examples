@@ -20,6 +20,9 @@
 # Environment
 .env
 
+# Post-quantum keystores written by examples/pq-keys
+pq-keystore*.json
+
 # OS
 .DS_Store
 Thumbs.db

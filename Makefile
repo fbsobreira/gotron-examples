@@ -2,11 +2,14 @@ SHELL := /bin/bash
 GO    := go
 MODULE := github.com/fbsobreira/gotron-examples
 
-EXAMPLES := address justlend-energy sunswap
+EXAMPLES := address justlend-energy sunswap pq-capabilities pq-keys pq-transfer pq-migrate
 
 GOIMPORTS_VERSION := v0.28.0
 
-.PHONY: all build tidy tidy-check fmt fmt-check lint check clean $(addprefix run/,$(EXAMPLES))
+# FN-DSA-512 (Falcon) signing needs CGO and liboqs: brew install liboqs pkgconf
+GO_FALCON := CGO_ENABLED=1 $(GO)
+
+.PHONY: all build build-falcon tidy tidy-check fmt fmt-check lint check clean $(addprefix run/,$(EXAMPLES)) run/pq-keys-falcon
 
 all: check build
 
@@ -60,6 +63,24 @@ run/sunswap:
 
 run/justlend-energy:
 	$(GO) run ./examples/justlend-energy $(ARGS)
+
+run/pq-capabilities:
+	$(GO) run ./examples/pq-capabilities $(ARGS)
+
+run/pq-keys:
+	$(GO) run ./examples/pq-keys $(ARGS)
+
+run/pq-keys-falcon:
+	$(GO_FALCON) run -tags falcon ./examples/pq-keys -scheme fn-dsa-512 $(ARGS)
+
+run/pq-transfer:
+	$(GO_FALCON) run -tags falcon ./examples/pq-transfer $(ARGS)
+
+run/pq-migrate:
+	$(GO) run ./examples/pq-migrate $(ARGS)
+
+build-falcon:
+	$(GO_FALCON) build -tags falcon ./...
 
 ## Cleanup
 
