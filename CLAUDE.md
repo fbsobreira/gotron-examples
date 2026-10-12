@@ -7,7 +7,7 @@ Example applications demonstrating [gotron-sdk](https://github.com/fbsobreira/go
 ## Structure
 
 ```
-go.mod                  # Module root — uses gotron-sdk@master via replace directive
+go.mod                  # Module root — requires gotron-sdk@master (pseudo-version)
 utils/                  # Shared helper utilities (connection, formatting, etc.)
 examples/{name}/        # Each example is a standalone main package
 mcp-feedback.md         # Feedback/issues found while using GoTRON MCP server
@@ -16,7 +16,7 @@ mcp-feedback.md         # Feedback/issues found while using GoTRON MCP server
 ## Dependencies
 
 - **Go 1.26**
-- **gotron-sdk**: always use `@master` branch (replace directive in go.mod)
+- **gotron-sdk**: always use the `@master` branch; update with `go get github.com/fbsobreira/gotron-sdk@master && go mod tidy`
 - TRON mainnet gRPC endpoint: `grpc.trongrid.io:50051`
 
 ## Conventions
