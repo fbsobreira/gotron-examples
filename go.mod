@@ -3,7 +3,7 @@ module github.com/fbsobreira/gotron-examples
 go 1.26
 
 require (
-	github.com/fbsobreira/gotron-sdk v0.26.1-0.20261012154253-633ff019e782
+	github.com/fbsobreira/gotron-sdk v0.27.0
 	golang.org/x/term v0.45.0
 	google.golang.org/grpc v1.82.1
 )

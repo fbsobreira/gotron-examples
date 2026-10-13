@@ -14,6 +14,8 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -37,26 +39,19 @@ const (
 	ModePQOnly = "pq-only"
 )
 
-// defaultActiveOperations is used when the account has no active permission
-// to copy operations from.
-var defaultActiveOperations = []string{
-	"TransferContract", "TransferAssetContract", "TriggerSmartContract",
-	"AccountUpdateContract", "FreezeBalanceV2Contract", "UnfreezeBalanceV2Contract",
-	"DelegateResourceContract", "UnDelegateResourceContract", "VoteWitnessContract",
-	"WithdrawExpireUnfreezeContract", "WithdrawBalanceContract", "AccountPermissionUpdateContract",
-}
-
 func main() {
 	var (
 		keystorePath string
 		mode         string
 		node         string
+		operations   string
 		confirm      bool
 	)
 
 	flag.StringVar(&keystorePath, "keystore", os.Getenv("PQ_KEYSTORE"), "Keystore of the PQ key to authorize (default: $PQ_KEYSTORE)")
 	flag.StringVar(&mode, "mode", ModeEither, "Permission layout: either (ECDSA or PQ), both (ECDSA and PQ), pq-only")
 	flag.StringVar(&node, "node", utils.NileNode, "gRPC node")
+	flag.StringVar(&operations, "operations", "", "Active operations as a hex bitmap, only for an account with no stored permissions")
 	flag.BoolVar(&confirm, "confirm", false, "Sign and broadcast the update (default: dry run)")
 	flag.Parse()
 
@@ -113,32 +108,24 @@ func main() {
 	fmt.Println("Current permissions:")
 	printPermissions(acc)
 
-	activeName := "active"
-	var activeOps []string
-	if actives := acc.GetActivePermission(); len(actives) == 1 {
-		activeName = actives[0].GetPermissionName()
-		activeOps = decodeOperations(actives[0].GetOperations())
-	}
-	if len(activeOps) == 0 {
-		activeOps = defaultActiveOperations
-	}
-	ops := make(map[string]bool, len(activeOps))
-	for _, op := range activeOps {
-		ops[op] = true
+	// The update replaces every permission, so start from the current ones:
+	// that keeps the active permission's name and operations.
+	ownerPerm, _, actives, err := client.PermissionUpdateMaps(acc)
+	switch {
+	case errors.Is(err, client.ErrNoStoredPermissions):
+		ownerPerm, actives = permissionsFromFlag(operations)
+	case err != nil:
+		log.Fatalf("read current permissions: %v", err)
+	case operations != "":
+		log.Fatal("-operations is only for an account with no stored permissions; this account's active operations are kept")
 	}
 
-	// The update replaces every permission. The active permission gets the same
-	// keys as owner: an ECDSA-only active permission would still allow
-	// transfers with the ECDSA key alone.
-	ext, err := conn.UpdateAccountPermissionCtx(ctx, owner,
-		map[string]interface{}{"threshold": threshold, "keys": keys},
-		nil,
-		[]map[string]interface{}{{
-			"name":       activeName,
-			"threshold":  threshold,
-			"keys":       keys,
-			"operations": ops,
-		}})
+	// The active permission gets the same keys as owner: an ECDSA-only active
+	// permission would still allow transfers with the ECDSA key alone.
+	ownerPerm["threshold"], ownerPerm["keys"] = threshold, keys
+	actives[0]["threshold"], actives[0]["keys"] = threshold, keys
+
+	ext, err := conn.UpdateAccountPermissionCtx(ctx, owner, ownerPerm, nil, actives)
 	if err != nil {
 		log.Fatalf("build permission update failed: %v", err)
 	}
@@ -214,10 +201,11 @@ func checkAccount(acc *core.Account, owner string) {
 	if len(acc.GetActivePermission()) > 1 {
 		log.Fatal("account has several active permissions; this example would replace them with one")
 	}
-	// The ECDSA key must be able to sign the update under the current owner permission.
-	op := acc.GetOwnerPermission()
-	if op == nil {
-		return // default owner permission: the account's own key, threshold 1
+	// The ECDSA key must be able to sign the update under the current owner
+	// permission, stored or implicit (the account's own key, threshold 1).
+	op, err := client.SigningPermission(acc, 0)
+	if err != nil {
+		log.Fatalf("owner permission: %v", err)
 	}
 	var weight int64
 	for _, k := range op.GetKeys() {
@@ -276,22 +264,28 @@ func printPermission(kind string, p *core.Permission) {
 	}
 }
 
-// decodeOperations turns a permission's 32-byte operations bitmap (bit n =
-// contract type n) into contract type names.
-func decodeOperations(bitmap []byte) []string {
-	var names []string
-	for i := 0; i < len(bitmap)*8; i++ {
-		if bitmap[i/8]&(1<<(i%8)) == 0 {
-			continue
-		}
-		name, ok := core.Transaction_Contract_ContractType_name[int32(i)]
-		if !ok {
-			log.Printf("warning: dropping unknown operation bit %d", i)
-			continue
-		}
-		names = append(names, name)
+// permissionsFromFlag builds the owner and active permissions for an account
+// that has none stored: one created before multi-sign, at genesis or by a
+// contract. No API gives the network's default active operations, and
+// proposals change them, so the user passes them as a hex bitmap.
+func permissionsFromFlag(operations string) (map[string]interface{}, []map[string]interface{}) {
+	if operations == "" {
+		log.Fatal("account has no stored owner or active permission, so there are no operations to copy. " +
+			"Pass -operations with the active permission's hex operations bitmap, copied from an account " +
+			"created recently on the same network")
 	}
-	return names
+	bitmap, err := hex.DecodeString(operations)
+	if err != nil {
+		log.Fatalf("-operations: %v", err)
+	}
+	ops, err := client.PermissionOperations(bitmap)
+	if err != nil {
+		log.Fatalf("-operations: %v", err)
+	}
+	if len(ops) == 0 {
+		log.Fatal("-operations sets no operations")
+	}
+	return map[string]interface{}{}, []map[string]interface{}{{"name": "active", "operations": ops}}
 }
 
 // chainParam reads one dynamic chain parameter by key.
