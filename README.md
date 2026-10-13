@@ -136,7 +136,7 @@ go run ./examples/pq-migrate -keystore pq-keystore-fn.json -mode pq-only -confir
 Keystores hold secret keys: keep them out of version control (`pq-keystore*.json` is in `.gitignore`).
 Never pass a private key or passphrase as a command-line argument.
 
-To use these keystores from the command line, starting with the next GoTRON release, download the
+To use these keystores from the command line, since v0.27.0, download the
 `tronctl-pq_<version>_<os>_<arch>` archive. It has liboqs linked in, so nothing else needs installing. The
 default `tronctl` (release archives, Homebrew, `go install`) can import FN-DSA-512 keys but cannot create or sign
 with them. See [tronctl builds with FN-DSA-512](https://github.com/fbsobreira/gotron-sdk/blob/master/docs/post-quantum.md#tronctl-builds-with-fn-dsa-512).
@@ -160,6 +160,9 @@ first, send a PQ-signed transaction with `pq-transfer -from`, then tighten. Afte
 also needs an ECDSA co-signature, which `pq-transfer` does not add (use a multi-sign tool such as wallet-cli).
 The example refuses witness accounts (their witness permission takes exactly one key) and accounts with more
 than one active permission. Any other key on the active permission is removed, and the dry run says so.
+The active permission keeps its name and operations. An account with no stored permissions (created before
+multi-sign, at genesis or by a contract) has no operations to copy, and no API gives the network's defaults, so
+pass them with `-operations <hex bitmap>`, copied from an account created recently on the same network.
 
 The alternative is to create a new PQ account and move the assets to it. That gives a **different address**, and
 every exchange, DApp and contract allowance has to learn it.
